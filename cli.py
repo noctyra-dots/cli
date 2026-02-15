@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import argparse
+import shutil
 from pathlib import Path
 
 STOW_DIR = Path("/usr/share/noctyra/stow")
@@ -22,6 +23,71 @@ def get_stow_packages():
         return []
     return [d.name for d in STOW_DIR.iterdir() if d.is_dir()]
 
+def cleanup_conflicts(package, stow_dir, target_dir):
+    """
+    Remove files/directories in target_dir that strictly conflict with
+    the package contents, allowing stow to proceed.
+    """
+    package_path = stow_dir / package
+    if not package_path.exists():
+        return
+
+    # Helper to resolve absolute path safely
+    def is_correct_link(link, target):
+        try:
+            return link.resolve(strict=True) == target.resolve(strict=True)
+        except Exception:
+            return False
+
+    # Walk top-down
+    for root, dirs, files in os.walk(package_path):
+        rel_root = Path(root).relative_to(package_path)
+        
+        # Check directories (source is dir)
+        # We only care if target is a FILE (blocking dir creation/traversal)
+        for d in dirs:
+            rel_path = rel_root / d
+            target_path = target_dir / rel_path
+            
+            # Check if exists (including broken symlinks)
+            if target_path.is_symlink() or target_path.exists():
+                if not target_path.is_dir():
+                    # It's a file (or symlink to file) blocking a directory
+                    print(f"  [CLEANUP] Removing file blocking directory: {target_path}")
+                    try:
+                        target_path.unlink()
+                    except OSError as e:
+                        print(f"  [WARN] Failed to remove {target_path}: {e}")
+        
+        # Check files (source is file)
+        for f in files:
+            rel_path = rel_root / f
+            target_path = target_dir / rel_path
+            source_file = package_path / rel_path
+            
+            if target_path.is_symlink():
+                # Check where it points
+                if not is_correct_link(target_path, source_file):
+                    print(f"  [CLEANUP] Replacing symlink: {target_path}")
+                    try:
+                        target_path.unlink()
+                    except OSError as e:
+                        print(f"  [WARN] Failed to remove {target_path}: {e}")
+            elif target_path.exists():
+                 # It's a real file (or dir? if source is file and target is dir)
+                 if target_path.is_dir():
+                     print(f"  [CLEANUP] Removing directory blocking file: {target_path}")
+                     try:
+                         shutil.rmtree(target_path)
+                     except OSError as e:
+                         print(f"  [WARN] Failed to remove {target_path}: {e}")
+                 else:
+                     print(f"  [CLEANUP] Removing conflicting file: {target_path}")
+                     try:
+                         target_path.unlink()
+                     except OSError as e:
+                         print(f"  [WARN] Failed to remove {target_path}: {e}")
+
 def install(args):
     if not check_stow_installed():
         return
@@ -37,6 +103,10 @@ def install(args):
     success_count = 0
     for package in packages:
         print(f"Installing {package}...")
+        
+        # Clean up conflicts before stowing
+        cleanup_conflicts(package, STOW_DIR, home_dir)
+
         try:
             # -t: target directory (home)
             # -d: stow directory (/usr/share/noctyra/stow)
